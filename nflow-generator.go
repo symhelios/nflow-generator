@@ -8,9 +8,11 @@ package main
 import (
 	"fmt"
 	"github.com/jessevdk/go-flags"
-	"math/rand"
-	"net"
 	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -31,15 +33,19 @@ const (
 	BITTORRENT
 )
 
+var CollectorAddr string
+
 var opts struct {
 	CollectorIP   string `short:"t" long:"target" description:"target ip address of the netflow collector"`
 	CollectorPort string `short:"p" long:"port" description:"port number of the target netflow collector"`
 	SpikeProto    string `short:"s" long:"spike" description:"run a second thread generating a spike for the specified protocol"`
-    FalseIndex    bool   `short:"f" long:"false-index" description:"generate false SNMP interface indexes, otherwise set to 0"`
-    Help          bool   `short:"h" long:"help" description:"show nflow-generator help"`
+	NumPerSec     string `short:"n" long:"num_per_sec" description:"number of packets to send per second"`
+	FalseIndex    bool   `short:"f" long:"false-index" description:"generate false SNMP interface indexes, otherwise set to 0"`
+	Help          bool   `short:"h" long:"help" description:"show nflow-generator help"`
 }
 
 func main() {
+	InitLog()
 
 	_, err := flags.Parse(&opts)
 	if err != nil {
@@ -54,52 +60,45 @@ func main() {
 		showUsage()
 		os.Exit(1)
 	}
-	collector := opts.CollectorIP + ":" + opts.CollectorPort
-	udpAddr, err := net.ResolveUDPAddr("udp", collector)
+
+	numPerSec, err := strconv.Atoi(opts.NumPerSec)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Invalid option NumPerSec: cannot parse value " + opts.NumPerSec)
+		showUsage()
+		os.Exit(1)
 	}
-	conn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		log.Fatal("Error connecting to the target collector: ", err)
-	}
+
+	CollectorAddr = opts.CollectorIP + ":" + opts.CollectorPort
+
 	log.Infof("sending netflow data to a collector ip: %s and port: %s. \n"+
 		"Use ctrl^c to terminate the app.", opts.CollectorIP, opts.CollectorPort)
-
+	
+	/* launch worker pool */
+	
+	wp := NewWorkerPool(5, 2 * numPerSec)
+	wp.Start()
+	
+	/* start to add tasks and pull result */
+	
+	var count = uint(0)
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	tick := time.Tick(time.Second)
 	for {
-		rand.Seed(time.Now().Unix())
-		n := randomNum(50, 1000)
-		// add spike data
-		if opts.SpikeProto != "" {
-			GenerateSpike()
+		select {
+		case <-c:
+			log.Info("Received terminating signal, stopping workers...\n")
+			wp.Stop()
+			log.Infof("All workers stopped, %d packets sent successfully\n", wp.GetSuccessCount())
+			
+			os.Exit(0)
+		case <-tick:
+			wp.AddMultipleTask(sendPackets, numPerSec)
+			newCount := wp.GetSuccessCount()
+			log.Infof("Running %d workers, %d packets sent in last second", runtime.NumGoroutine(), newCount - count)
+			count = newCount
 		}
-		if n > 900 {
-			data := GenerateNetflow(8)
-			buffer := BuildNFlowPayload(data)
-			_, err := conn.Write(buffer.Bytes())
-			if err != nil {
-				log.Fatal("Error connecting to the target collector: ", err)
-			}
-		} else {
-			data := GenerateNetflow(16)
-			buffer := BuildNFlowPayload(data)
-			_, err := conn.Write(buffer.Bytes())
-			if err != nil {
-				log.Fatal("Error connecting to the target collector: ", err)
-			}
-		}
-		// add some periodic spike data
-		if n < 150 {
-			sleepInt := time.Duration(3000)
-			time.Sleep(sleepInt * time.Millisecond)
-		}
-		sleepInt := time.Duration(n)
-		time.Sleep(sleepInt * time.Millisecond)
 	}
-}
-
-func randomNum(min, max int) int {
-	return rand.Intn(max-min) + min
 }
 
 func showUsage() {
@@ -130,6 +129,7 @@ Application Options:
         bittorrent - generates udp/6682
   -f, --false-index generate false snmp index values of 1 or 2: If the source address > dest address, input interface is set to 1, and set to 2 otherwise,
 and the output interface is set to the opposite value. Default in and out interface is 0. (Optional)
+  -n, --num_per_sec= number of packets to send per second (not guaranteed)
 
 Example Usage:
 
